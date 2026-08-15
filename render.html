@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+
+<head>
+	<meta charset="utf-8">
+	<title>Painterly Render</title>
+	<style>
+		body { margin: 0; background: #222; }
+		canvas { display: block; }
+	</style>
+	<script src="./p5.min.js"></script>
+	<script src="./painterly.js"></script>
+	<script src="./sketch.js"></script>
+	<script>
+		// 給 headless 用的渲染入口：
+		//   window.renderMode('painting') 切模式並重畫
+		//   window.grab() 回傳 dataURL
+		window.addEventListener('load', () => {
+			window.renderMode = (m, s) => {
+				mode = m;
+				if (s !== undefined) { seed = s; }
+				rebuild();
+				return true;
+			};
+			window.grab = () => document.querySelector('canvas').toDataURL('image/png');
+			window.setOpts = (o) => {
+				Object.assign(uiValues, o);
+				applyUIToBrush();
+				brush.rng = makeRng(seed);
+				redraw();
+				return true;
+			};
+			window.__ready = true;
+		});
+	</script>
+</head>
+
+<body>
+	<div id="sketch-holder"></div>
+</body>
+
+</html>
