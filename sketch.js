@@ -584,16 +584,19 @@ function buildRow(ctl) {
 	input.step = ctl.step;
 	input.value = uiValues[ctl.key];
 
-	const commit = (v) => {
+	const commit = (v, draft) => {
 		uiValues[ctl.key] = v;
 		input.value = v;
 		val.value = v;
 		applyUIToBrush();
-		rerender();
+		rerender(draft);
 	};
 
-	input.addEventListener('input', () => commit(parseFloat(input.value)));
-	val.addEventListener('change', () => commit(parseFloat(val.value)));
+	// 拖曳中用草稿畫質 (pixelDensity 1) 求即時回饋，
+	// 放開後再用完整畫質重畫一次。
+	input.addEventListener('input', () => commit(parseFloat(input.value), true));
+	input.addEventListener('change', () => commit(parseFloat(input.value), false));
+	val.addEventListener('change', () => commit(parseFloat(val.value), false));
 
 	inputRefs[ctl.key] = { input, val };
 
@@ -651,9 +654,46 @@ function syncInputs() {
 	}
 }
 
-/** 重畫。重置 rng，讓調參前後的構圖完全一樣，只有紋理不同。 */
-function rerender() {
+let draftTimer = null;
+let pendingDraft = false;
+
+/**
+ * 重畫。重置 rng，讓調參前後的構圖完全一樣，只有紋理不同。
+ *
+ * draft = true 時降到 pixelDensity 1 (像素數少 4 倍) 且筆畫取樣變疏，
+ * 換取拖曳時的即時回饋；停手 300ms 後自動用完整畫質重畫一次。
+ *
+ * 拖曳時滑桿會連續丟出 input 事件，但一次重畫要幾百 ms，
+ * 事件會塞住主執行緒讓畫面看起來卡住。所以用 rAF 合併：
+ * 同一個 frame 內不管收到幾次都只畫一次，永遠畫最新的值。
+ */
+function rerender(draft) {
+	clearTimeout(draftTimer);
+
+	if (draft) {
+		if (pendingDraft) {
+			return;
+		}
+		pendingDraft = true;
+		requestAnimationFrame(() => {
+			pendingDraft = false;
+			doRender(true);
+			// 停手之後補一張完整畫質
+			draftTimer = setTimeout(() => doRender(false), 300);
+		});
+		return;
+	}
+
+	doRender(false);
+}
+
+function doRender(draft) {
+	const want = draft ? 1 : 2;
+	if (pixelDensity() !== want) {
+		pixelDensity(want);
+	}
 	if (brush) {
+		brush.draftQuality = draft ? 0.3 : 1;
 		brush.rng = makeRng(seed);
 	}
 	redraw();

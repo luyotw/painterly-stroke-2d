@@ -260,6 +260,10 @@ class PainterlyBrush {
 		// 斑駁紋理的偏移；固定在 brush 上，讓整張畫的壁面紋理是連續的一片，
 		// 而不是每個色塊各自為政 (那會讓色塊邊界過於明顯)
 		this.mottleOffset = this.rng() * 500;
+
+		// 繪製品質。1 = 完整，< 1 = 草稿 (取樣變疏、刷毛變少)。
+		// 只影響速度與細緻度，不影響構圖與色調。
+		this.draftQuality = 1;
 	}
 
 	setOption(key, value) {
@@ -310,11 +314,13 @@ class PainterlyBrush {
 		const nx = -uy;
 		const ny = ux;
 
-		// 沿路徑的取樣點數
-		const steps = Math.max(2, Math.ceil(len / o.stepPx));
+		// 沿路徑的取樣點數。draftQuality < 1 時取樣變疏、刷毛變少，
+		// 用來換取拖曳滑桿時的即時回饋 (視覺上略糙，但構圖與色調一致)。
+		const q = this.draftQuality;
+		const steps = Math.max(2, Math.ceil(len / (o.stepPx / q)));
 
 		// 刷毛數量
-		const bristleCount = Math.max(1, Math.round(w * o.bristleDensity));
+		const bristleCount = Math.max(1, Math.round(w * o.bristleDensity * q));
 		const spacing = bristleCount > 1 ? w / (bristleCount - 1) : 0;
 
 		// 每根刷毛獨立的雜訊種子，讓條紋彼此不相關
@@ -411,7 +417,9 @@ class PainterlyBrush {
 			let c = shadeRgb(rgb, (bristleTone - 0.5) * 0.22);
 			c = hueDriftRgb(c, drift);
 
-			const alpha = o.bristleAlpha * edgeFade * lerp2(0.35, 1.5, bristleTone);
+			// 草稿模式刷毛數量變少，透明度要補回來，
+			// 否則調參時看到的色調會比最終結果淡
+			const alpha = (o.bristleAlpha / q) * edgeFade * lerp2(0.35, 1.5, bristleTone);
 			g.stroke(rgbaStr(c, clamp01(alpha)));
 			g.strokeWeight(bw);
 			g.endShape();
@@ -422,7 +430,11 @@ class PainterlyBrush {
 		// --- 濃淡斑駁 ---
 		// 遮罩要「比筆身稍微窄」，不能比它寬。
 		// 遮罩一旦超出實際上色的範圍，就會在筆畫四周留下一圈被洗過的矩形光暈。
-		if (o.strokeBody > 0) {
+		//
+		// 只有「單獨畫的筆畫」才需要在這裡做。fillPolygon() 內部的填色筆畫
+		// 會走 finish() 的整張一次處理，若在這裡又各自做一次，
+		// 一張圖會多出幾十次 getImageData/putImageData，那是主要的效能瓶頸。
+		if (o.strokeBody > 0 && !o.skipStrokeMottle) {
 			const hw = w * 0.34;
 			const mnx = Math.min(x1, x2) - hw;
 			const mny = Math.min(y1, y2) - hw;
@@ -992,19 +1004,108 @@ class PainterlyBrush {
 	finish(opt = {}) {
 		const queue = this.mottleQueue ?? [];
 
-		// 依照當初繪製的順序套用。重疊處由後面的色塊覆蓋前面的，
-		// 所以每個像素最終只會被套用一次，不會出現亮度疊加的接縫。
-		for (const job of queue) {
-			this.maskedMottle(
-				job.poly, job.minX, job.minY, job.maxX, job.maxY,
-				Object.assign({}, this.opts, job.opts)
-			);
+		// 整張一次做完，而不是每個色塊各自 getImageData/putImageData。
+		//
+		// 色塊會互相重疊，逐塊處理時同一片像素會被讀寫很多次，
+		// 那是這裡最大的效能瓶頸 (整張圖下來好幾秒)。
+		// 改成先把每個像素該用哪一組參數畫成一張「參數圖」，
+		// 再對整張畫布掃一次，讀寫都只做一遍。
+		if (queue.length > 0) {
+			this.applyQueuedMottle(queue);
 		}
 		this.mottleQueue = [];
 
 		if ((opt.grain ?? true) && this.opts.grainAmount > 0) {
 			this.grain(opt);
 		}
+	}
+
+	/**
+	 * 把佇列裡所有色塊的斑駁一次套用完。
+	 *
+	 * 步驟：
+	 *   1. 在一張暫存 canvas 上，依繪製順序把每個色塊塗成一個「索引色」，
+	 *      得到一張「這個像素屬於第幾個色塊」的地圖。後畫的蓋掉先畫的，
+	 *      所以重疊處自然只會有一個值 —— 這也保證每個像素只被套用一次。
+	 *   2. 對主畫布做一次 getImageData，照著索引查參數，套用斑駁。
+	 *   3. 一次 putImageData 寫回去。
+	 *
+	 * 相較於逐色塊處理，讀寫次數從「色塊數」降到 1。
+	 */
+	applyQueuedMottle(queue) {
+		const g = this.target;
+		const ctx = g.drawingContext;
+		const W = ctx.canvas.width;
+		const H = ctx.canvas.height;
+		const dpr = g.pixelDensity ? g.pixelDensity() : 1;
+
+		// --- 1. 索引圖 ---
+		const idxCanvas = document.createElement('canvas');
+		idxCanvas.width = W;
+		idxCanvas.height = H;
+		const ictx = idxCanvas.getContext('2d', { willReadFrequently: true });
+		ictx.scale(dpr, dpr);
+		for (let k = 0; k < queue.length; k += 1) {
+			const poly = queue[k].poly;
+			// k+1 存進 R 通道 (0 代表沒有任何色塊)
+			ictx.fillStyle = `rgb(${(k + 1) & 255},0,0)`;
+			ictx.beginPath();
+			ictx.moveTo(poly[0].x, poly[0].y);
+			for (let i = 1; i < poly.length; i += 1) {
+				ictx.lineTo(poly[i].x, poly[i].y);
+			}
+			ictx.closePath();
+			ictx.fill();
+		}
+		const idxData = ictx.getImageData(0, 0, W, H).data;
+
+		// --- 2. 每個色塊的參數先算好，避免在迴圈裡做物件合併 ---
+		const params = queue.map((job) => {
+			const o = Object.assign({}, this.opts, job.opts);
+			return {
+				amount: o.baseCoatMottle,
+				speck: o.mottleSpeckle,
+				field: o.baseCoatMottle > 0 ? this.getMottleField(o, dpr) : null,
+			};
+		});
+
+		// --- 3. 掃一次主畫布 ---
+		// 草稿模式下逐列跳著做 (STEP 列只處理 1 列)，
+		// 斑駁是低頻的，拖曳時看得出強弱變化就夠了。
+		const img = ctx.getImageData(0, 0, W, H);
+		const d = img.data;
+		const rng = this.rng;
+		const rowStep = this.draftQuality < 1 ? 2 : 1;
+
+		for (let y = 0; y < H; y += rowStep) {
+			const row = y * W;
+			for (let x = 0; x < W; x += 1) {
+				const p = row + x;
+				const k = idxData[p * 4];
+				if (k === 0) {
+					continue;
+				}
+				const par = params[k - 1];
+				if (!par || !par.field || par.amount <= 0) {
+					continue;
+				}
+				const idx = p * 4;
+				const av = d[idx + 3];
+				if (av === 0) {
+					continue;
+				}
+
+				const grit = (rng() - 0.5) * par.speck;
+				const n = par.field.data[p] + grit;
+				const delta = n * par.amount * 255 * 2.4 * (av / 255);
+
+				d[idx] = clampByte(d[idx] + delta * 1.06);
+				d[idx + 1] = clampByte(d[idx + 1] + delta * 1.0);
+				d[idx + 2] = clampByte(d[idx + 2] + delta * 0.88);
+			}
+		}
+
+		ctx.putImageData(img, 0, 0);
 	}
 
 	/**
@@ -1019,6 +1120,15 @@ class PainterlyBrush {
 	maskedMottle(poly, minX, minY, maxX, maxY, o) {
 		const g = this.target;
 		if (o.baseCoatMottle <= 0) {
+			return;
+		}
+
+		// 草稿模式跳過逐筆的斑駁。
+		// 每一筆都要 getImageData/putImageData/drawImage 一趟，一張圖幾十次，
+		// 那是拖曳滑桿時最主要的延遲來源。
+		// finish() 的整張斑駁仍然會做，所以外觀只是少了筆畫內部的細微濃淡，
+		// 放開滑桿後的完整重畫會補回來。
+		if (this.draftQuality < 1) {
 			return;
 		}
 
@@ -1094,14 +1204,20 @@ class PainterlyBrush {
 		// 刻意「沒有」低頻大尺度層。加了之後每個色塊會出現一道橫跨整片的
 		// 明暗漸層，看起來像被打光的 3D 面，而不是一片平塗的顏料。
 		// 中世紀 / 現代主義的平面色塊在「平均值」上必須是平的。
-		const ms = o.mottleMidScale;
-		const fs = o.mottleFineScale;
-		const off = this.mottleOffset;
 		const speck = o.mottleSpeckle;
 		const rng = this.rng;
 
+		// fbm 很貴 (4 octaves + 2 octaves，每個 octave 四次查表加內插)。
+		// 色塊互相重疊時，同一個座標會被重算很多次，整張圖下來是好幾秒。
+		//
+		// 所以改成先把整張畫布的雜訊場算成一張快取，之後只做查表。
+		// 快取只跟「頻率參數」有關，滑桿在調其他參數時完全不用重算。
+		const field = this.getMottleField(o, dpr);
+		const fdata = field.data;
+		const fw = field.w;
+
 		for (let j = 0; j < h; j += 1) {
-			const py = (y0 + j) / dpr;
+			const fy = y0 + j;
 			for (let i = 0; i < w; i += 1) {
 				const idx = (j * w + i) * 4;
 				// 全透明的地方不要動 (色塊外、或是被乾擦挖掉的洞)
@@ -1109,14 +1225,11 @@ class PainterlyBrush {
 				if (av === 0) {
 					continue;
 				}
-				const px = (x0 + i) / dpr;
 
-				const mid = nz.fbm(px * ms + off, py * ms + off, 4) - 0.5;
-				const micro = nz.fbm(px * fs + off * 3, py * fs + off * 3, 2) - 0.5;
 				// 顆粒不經過任何內插，才留得住「牙口」的鋭利感
 				const grit = (rng() - 0.5) * speck;
 
-				const n = mid * 1.0 + micro * 0.45 + grit;
+				const n = fdata[fy * fw + (x0 + i)] + grit;
 				// 依 alpha 衰減：半透明的像素 (乾擦挖出來的洞的邊緣) 其 RGB
 				// 是未預乘的，數值不可靠，直接照著加會把黑色帶進畫面。
 				const delta = n * amount * 255 * 2.4 * (av / 255);
@@ -1128,6 +1241,92 @@ class PainterlyBrush {
 				d[idx + 2] = clampByte(d[idx + 2] + delta * 0.88);
 			}
 		}
+	}
+
+	/**
+	 * 取得整張畫布的斑駁雜訊場 (不含每像素顆粒)。
+	 *
+	 * 這是效能的關鍵。原本是每個像素現算 fbm，色塊重疊處還會重算好幾次，
+	 * 1800x1800 下光這一項就要 9 秒以上，滑桿完全沒辦法用。
+	 *
+	 * 兩個優化：
+	 *   1. 整張只算一次，之後查表。
+	 *   2. 用降取樣的網格算 (STEP)，再雙線性內插放大。
+	 *      斑駁本身就是低頻的雲斑，降取樣看不出差別，但計算量少了 STEP^2 倍。
+	 *
+	 * 快取只在「頻率相關的參數」改變時才重算，
+	 * 所以拉「斑駁強度」「顆粒比重」這類滑桿是即時的。
+	 */
+	getMottleField(o, dpr) {
+		const g = this.target;
+		const W = g.drawingContext.canvas.width;
+		const H = g.drawingContext.canvas.height;
+
+		// planeVariation 會讓每個色塊的頻率略有不同，如果照實際數值當 key，
+		// 等於每個色塊都要重算一次整張，完全沒有快取效果。
+		// 所以把頻率量化成有限的級距 (視覺上分辨不出差別)，
+		// 讓不同色塊可以共用同一張快取。
+		const q = (v) => Math.round(Math.log(Math.max(v, 1e-6)) * 6);
+		const qm = q(o.mottleMidScale);
+		const qf = q(o.mottleFineScale);
+		const key = [W, H, dpr, qm, qf].join('|');
+
+		this._fields = this._fields ?? new Map();
+		if (this._fields.has(key)) {
+			return this._fields.get(key);
+		}
+		// 級距數有限，但還是設個上限避免無限成長
+		if (this._fields.size > 24) {
+			this._fields.clear();
+		}
+
+		// 降取樣步長。雲斑最細的成分約 3px，取 3 還在安全範圍內。
+		const STEP = 3;
+		const gw = Math.ceil(W / STEP) + 2;
+		const gh = Math.ceil(H / STEP) + 2;
+		const coarse = new Float32Array(gw * gh);
+
+		const nz = this.noise;
+		// 用量化後的級距回推頻率，確保同一個 key 一定對應同一張場
+		const ms = Math.exp(qm / 6);
+		const fs = Math.exp(qf / 6);
+		const off = this.mottleOffset;
+
+		for (let j = 0; j < gh; j += 1) {
+			const py = (j * STEP) / dpr;
+			for (let i = 0; i < gw; i += 1) {
+				const px = (i * STEP) / dpr;
+				const mid = nz.fbm(px * ms + off, py * ms + off, 4) - 0.5;
+				const micro = nz.fbm(px * fs + off * 3, py * fs + off * 3, 2) - 0.5;
+				coarse[j * gw + i] = mid + micro * 0.45;
+			}
+		}
+
+		// 放大回實際解析度 (雙線性內插)
+		const full = new Float32Array(W * H);
+		for (let y = 0; y < H; y += 1) {
+			const gy = y / STEP;
+			const j0 = Math.floor(gy);
+			const ty = gy - j0;
+			const r0 = j0 * gw;
+			const r1 = (j0 + 1) * gw;
+			for (let x = 0; x < W; x += 1) {
+				const gx = x / STEP;
+				const i0 = Math.floor(gx);
+				const tx = gx - i0;
+				const a = coarse[r0 + i0];
+				const b = coarse[r0 + i0 + 1];
+				const c = coarse[r1 + i0];
+				const e = coarse[r1 + i0 + 1];
+				const top = a + (b - a) * tx;
+				const bot = c + (e - c) * tx;
+				full[y * W + x] = top + (bot - top) * ty;
+			}
+		}
+
+		const field = { data: full, w: W, h: H };
+		this._fields.set(key, field);
+		return field;
 	}
 
 	/**
